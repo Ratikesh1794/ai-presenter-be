@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+openai
+pydantic
+python-dotenv
+websockets
+python-pptx>=0.6.23
+python-multipart>=0.0.9
+aiofiles
