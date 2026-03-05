@@ -43,4 +43,14 @@ class InterruptedMessage(BaseModel):
     type: Literal["interrupted"] = "interrupted"
 
 
-ServerMessage = Union[ChangeSlideMessage, SpeakMessage, StatusMessage, InterruptedMessage]
+class CostMessage(BaseModel):
+    """Message containing API cost information for the current session."""
+    type: Literal["cost_info"] = "cost_info"
+    total_calls: int
+    total_input_tokens: int
+    total_output_tokens: int
+    total_cost: float
+    average_cost_per_call: float
+
+
+ServerMessage = Union[ChangeSlideMessage, SpeakMessage, StatusMessage, InterruptedMessage, CostMessage]

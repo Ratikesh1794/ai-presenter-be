@@ -8,6 +8,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from models.messages import (
     ChangeSlideMessage,
+    CostMessage,
     InterruptedMessage,
     SpeakMessage,
     StatusMessage,
@@ -15,8 +16,11 @@ from models.messages import (
 from services.agent import (
     answer_doubt,
     generate_intro,
+    get_session_cost_summary,
+    log_session_cost_summary,
     present_slide,
     process_user_message,
+    reset_session_costs,
 )
 from services.conetion_manager import ConnectionState, PresentationMode, manager
 from services.session_store import session_store
@@ -54,6 +58,17 @@ async def _emit_result(state: ConnectionState, result) -> None:
         await asyncio.sleep(tts_duration)
 
 
+async def _emit_cost_info(state: ConnectionState) -> None:
+    """Send cost information for the current session to the client."""
+    cost_summary = get_session_cost_summary()
+    if cost_summary["total_calls"] > 0:
+        await send(state, CostMessage(**cost_summary))
+        logger.info(
+            f"[COST] Sent to client: {cost_summary['total_calls']} calls, "
+            f"${cost_summary['total_cost']:.6f} total"
+        )
+
+
 # ─── Presentation loop ────────────────────────────────────────────────────────
 
 async def run_presentation(state: ConnectionState) -> None:
@@ -79,6 +94,9 @@ async def run_presentation(state: ConnectionState) -> None:
             if state.cancel_event.is_set():
                 return
             await _emit_result(state, result)
+
+        # Send cost info after intro
+        await _emit_cost_info(state)
 
         if state.cancel_event.is_set():
             return
@@ -109,6 +127,9 @@ async def run_presentation(state: ConnectionState) -> None:
                     logger.info("[PRES] Presentation complete!")
                     state.mode = PresentationMode.COMPLETE
                     await send(state, StatusMessage(state="idle"))
+                    # Send cost info before completion
+                    await _emit_cost_info(state)
+                    log_session_cost_summary()
                     # Notify frontend presentation is done
                     await state.websocket.send_text(json.dumps({
                         "type": "presentation_complete"
@@ -153,6 +174,9 @@ async def run_doubt(state: ConnectionState, question: str) -> None:
             if state.cancel_event.is_set():
                 return
             await _emit_result(state, result)
+
+        # Send cost info after doubt is answered
+        await _emit_cost_info(state)
 
         if state.cancel_event.is_set():
             return
@@ -278,6 +302,7 @@ async def websocket_endpoint(websocket: WebSocket):
             # ── start_presentation ────────────────────────────────────────────
             elif msg_type == "start_presentation":
                 logger.info("[WS] Starting presentation")
+                reset_session_costs()
                 state.interrupt()
                 state.reset_cancel()
                 state.current_slide = 0

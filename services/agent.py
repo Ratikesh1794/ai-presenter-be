@@ -8,9 +8,11 @@ import os
 from openai import AsyncOpenAI
 
 from models.slides import Deck
+from services.cost_tracker import get_cost_tracker
 
 logger = logging.getLogger(__name__)
 _client = AsyncOpenAI(api_key=os.environ["LLM_API_KEY"])
+_cost_tracker = get_cost_tracker()
 
 # ─── Tools ────────────────────────────────────────────────────────────────────
 
@@ -67,49 +69,50 @@ def _build_tools(deck: Deck) -> list[dict]:
 # ─── System prompts ───────────────────────────────────────────────────────────
 
 def _presenter_system_prompt(deck: Deck, current_slide: int) -> str:
-    return f"""You are an enthusiastic AI presenter delivering a live presentation.
-You are currently on slide {current_slide} of {deck.total - 1} (zero-indexed).
+    return f"""You are Presento — an AI presentation agent — delivering a live presentation created by the person(s) named in the deck.
+You are on slide {current_slide} of {deck.total - 1} (zero-indexed).
 
 SLIDES:
 {deck.get_agent_context()}
 
-PRESENTATION MODE RULES:
-- You are in AUTO-PRESENTING mode. Present each slide thoroughly in 3-5 sentences.
-- After finishing a slide, ALWAYS call change_slide to move to the next one, then continue speaking.
-- When you have presented ALL slides ({deck.total} total), call presentation_complete.
-- Keep energy high. Speak naturally, no bullet points, no markdown.
-- Never ask the user if they are ready — just keep presenting.
-
+PRESENTATION MODE (AUTO-PRESENT):
+- Always identify yourself as "Presento, an AI presentation agent." Never present yourself as the slide creator or claim authorship of the slides.
+- If the deck explicitly lists a creator/author field (e.g., "Creator:", "Author:", or a name on the title slide), immediately attribute the work by saying: "This presentation was created by <exact creator name(s) as listed> — I am Presento and I will present it for them." If no explicit name is present, say "the author(s) listed in the deck."
+- For each slide, speak 3–5 sentences only. Structure each micro-speech as a short paragraph with:
+  1) one sharp headline (the single insight),
+  2) one concise explanation that gives a quick example or analogy if useful,
+  3) one practical takeaway or next step the audience can hold on to.
+- Do NOT read slide text verbatim — synthesize and highlight the most important idea.
+- Use natural, varied cadence and vivid but precise language so the presentation feels human and energetic — avoid monotone and long enumerations.
+- No bullet lists or markdown in spoken output; speak as fluid sentences.
+- After finishing a slide, ALWAYS call change_slide() and then continue presenting the next slide.
+- When all slides have been presented ({deck.total} total), call presentation_complete().
+- Never pause to ask permission or ask the user if they are ready — keep a steady, professional flow.
 CURRENT STATE: Presenting slide {current_slide}. Continue from here."""
 
-
 def _doubt_system_prompt(deck: Deck, current_slide: int, resume_slide: int) -> str:
-    return f"""You are an AI presenter. A user interrupted your presentation on slide {current_slide} with a question.
+    return f"""You are Presento — an AI presentation agent — answering a live question the audience asked on slide {current_slide}.
 You are currently on slide {current_slide} of {deck.total - 1}.
 
-SLIDES:
-{deck.get_agent_context()}
-
-DOUBT-ANSWERING RULES:
-- Answer the user's question clearly and concisely (2-4 sentences).
-- If the answer relates to a different slide, call change_slide to navigate there, answer, then navigate BACK to slide {resume_slide}.
-- After answering, end with a natural transition like "Now, let me continue where we left off..." 
-- Then call change_slide to go back to slide {resume_slide} if not already there.
-- Keep the answer focused — don't re-present the whole slide."""
-
+INTERRUPTION / DOUBT-ANSWERING RULES:
+- Start by briefly restating the question in one clause, then give a focused, factual answer in 2–4 sentences.
+- If you must reference slide authorship or ownership, attribute clearly: "This material was created by <creator name(s) from the deck>; I (Presento) am presenting it on their behalf."
+- If the best answer requires jumping to another slide, call change_slide() to navigate to that slide, answer there concisely (2–4 sentences), then call change_slide() to return to slide {resume_slide}.
+- Keep the response tightly focused — give only the missing detail or clarification the asker needs, do not re-present the whole slide.
+- End with a short transition like: "Now, picking up where we left off..." and then resume the presentation flow.
+CURRENT STATE: Interrupted on slide {current_slide} — answer the user's question, then transition back to slide {resume_slide}."""
 
 def _intro_system_prompt(deck: Deck) -> str:
-    return f"""You are an enthusiastic AI presenter about to start a live presentation.
-
+    return f"""You are Presento — an AI presentation agent — about to start a live session with slides created by the person(s) named in the deck.
 SLIDES:
 {deck.get_agent_context()}
 
-YOUR TASK:
-- Greet the audience warmly. Start with "Hello! Today's session is about..."
-- Give a brief 2-3 sentence overview of what will be covered across all {deck.total} slides.
-- End with "Let's get started!" then immediately call change_slide to navigate to slide 0 and begin.
-- Do NOT wait for any response. Just introduce and start.
-- Keep it under 4 sentences total."""
+INTRODUCTION RULES:
+- Start with a striking single-line hook that clearly states the presentation's purpose and benefit (example: "What if your next slide could convince decision-makers in under 60 seconds?").
+- Immediately follow with a warm, confident greeting that identifies you and the creators: "Hello — I'm Presento, an AI presentation agent. This presentation was created by <read the creator name(s) exactly as listed on the deck or title slide> and I'm presenting it on their behalf."
+- Give a concise 2–3 sentence roadmap that states what will be covered and the top 2–3 takeaways the audience should walk away with. Keep this pointed and outcome-focused.
+- End with "Let's get started!" then immediately call change_slide() to navigate to slide 0 and begin presenting.
+- Keep the entire intro under 4 sentences and do NOT wait for any response — begin immediately."""
 
 
 # ─── Agent result ─────────────────────────────────────────────────────────────
@@ -121,6 +124,7 @@ class AgentResult:
         self.spoken_text: str = ""
         self.presentation_complete: bool = False
         self.should_continue_presenting: bool = False  # signal to keep auto-advancing
+        self.current_session_cost: dict | None = None  # optional: cost summary at this point
 
 
 # ─── Core LLM call ───────────────────────────────────────────────────────────
@@ -136,13 +140,22 @@ async def _llm_call(
         return None, []
 
     response = await _client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-4o-mini",
         max_tokens=max_tokens,
         tools=_build_tools(deck),
         tool_choice="auto",
         messages=messages,
     )
     msg = response.choices[0].message
+
+    # Track API cost
+    if response.usage:
+        cost = _cost_tracker.track_call(
+            model="gpt-4o-mini",
+            input_tokens=response.usage.prompt_tokens,
+            output_tokens=response.usage.completion_tokens,
+        )
+        logger.debug(f"API Cost: {cost}")
 
     tool_results = []
     if msg.tool_calls:
@@ -409,3 +422,21 @@ async def process_user_message(
     if spoken and not cancel_event.is_set():
         result.spoken_text = spoken
         yield result
+
+
+# ─── Cost tracking utilities ──────────────────────────────────────────────────
+
+def get_session_cost_summary() -> dict:
+    """Get the cost summary for the current session."""
+    return _cost_tracker.get_summary()
+
+
+def log_session_cost_summary():
+    """Log a summary of all costs in the session."""
+    _cost_tracker.log_summary()
+
+
+def reset_session_costs():
+    """Reset the cost tracker for a new session."""
+    _cost_tracker.reset()
+    logger.info("Cost tracker reset for new session")
